@@ -3,11 +3,11 @@ package zpljet
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 )
 
-// Stable machine-readable error codes returned by the public API — compare
-// them against Error.Code. Full reference: https://zpljet.com/docs/errors
+// Stable API error codes for Error.Code.
 const (
 	// CodeInvalidRequest — 400: the request body failed validation;
 	// Error.Param names the offending field.
@@ -85,9 +85,7 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("zpljet: %s (HTTP %d)", e.Message, e.Status)
 }
 
-// ConnError means the request never produced a usable API response — DNS
-// failure, connection reset, TLS error, or a per-attempt timeout. The SDK
-// retries these automatically before returning one.
+// ConnError reports a network failure or per-attempt timeout.
 type ConnError struct {
 	msg     string
 	cause   error
@@ -103,8 +101,6 @@ func (e *ConnError) Unwrap() error { return e.cause }
 // Timeout reports whether the failure was a per-attempt timeout.
 func (e *ConnError) Timeout() bool { return e.timeout }
 
-// parseError builds an *Error from a non-2xx response body, tolerating
-// non-JSON bodies (e.g. gateway error pages).
 func parseError(status int, body []byte) *Error {
 	apiErr := &Error{
 		Status:  status,
@@ -132,9 +128,19 @@ func parseError(status int, body []byte) *Error {
 	apiErr.RetryAt = stringField(raw, "retryAt")
 	apiErr.ConversionID = stringField(raw, "conversionId")
 	if seconds, ok := raw["retryAfter"].(float64); ok {
-		apiErr.RetryAfter = time.Duration(seconds * float64(time.Second))
+		apiErr.RetryAfter = retryAfterDuration(seconds)
 	}
 	return apiErr
+}
+
+func retryAfterDuration(seconds float64) time.Duration {
+	if math.IsNaN(seconds) || seconds <= 0 {
+		return 0
+	}
+	if math.IsInf(seconds, 1) || seconds >= maxRetryDelay.Seconds() {
+		return maxRetryDelay
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
 
 func stringField(raw map[string]any, key string) string {

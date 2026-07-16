@@ -1,7 +1,4 @@
-# Go modules publish by pushing a tag — there is no registry step to gate.
-# This check is that gate: it fails the tag's workflow run if the Version
-# const wasn't bumped to match, so a mismatched release is caught the moment
-# it's pushed (delete the tag, fix the const, re-tag).
+# Validates tagged Go module releases.
 name: Release check
 
 on:
@@ -24,7 +21,7 @@ jobs:
             echo "Delete the tag, bump the const, and re-tag."
             exit 1
           fi
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - run: go vet ./...
