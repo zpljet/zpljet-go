@@ -1,11 +1,4 @@
-// Package zpljet is the official Go SDK for the ZPLJet API — fast ZPL →
-// PDF/PNG conversion. Zero dependencies, typed errors, automatic retries.
-//
-//	client, err := zpljet.New(os.Getenv("ZPLJET_API_KEY"))
-//	label, err := client.Convert(ctx, zpljet.ConvertRequest{ZPL: "^XA…^XZ"})
-//	os.WriteFile("label.pdf", label.Data, 0o644)
-//
-// Docs: https://zpljet.com/docs
+// Package zpljet provides the official Go client for the ZPLJet API.
 package zpljet
 
 import (
@@ -31,9 +24,8 @@ const (
 	defaultTimeout    = 60 * time.Second
 	defaultMaxRetries = 2
 	maxRetriesCap     = 10
-
-	// maxRetryDelay caps the sleep between retries, whatever the server asks.
-	maxRetryDelay = 30 * time.Second
+	baseRetryDelay    = 500 * time.Millisecond
+	maxRetryDelay     = 30 * time.Second
 )
 
 // Format is the output file format.
@@ -47,9 +39,7 @@ const (
 	FormatPNG Format = "png"
 )
 
-// ConvertRequest holds the parameters for POST /v1/convert. Zero values are
-// omitted from the request so the API defaults apply — see
-// https://zpljet.com/docs/api-reference for the canonical reference.
+// ConvertRequest contains POST /v1/convert parameters. Zero values use API defaults.
 type ConvertRequest struct {
 	// ZPL is the raw label program — one or more ^XA…^XZ blocks. Must start
 	// with ^XA (or ~DG) and end with ^XZ. Graphics must use uncompressed
@@ -93,12 +83,7 @@ type HostedLabel struct {
 	ExpiresAt time.Time `json:"expiresAt"`
 }
 
-// Client is a ZPLJet API client. It is safe for concurrent use; create one
-// and reuse it.
-//
-// Requests that fail with a rate limit (429), a transient server error, or a
-// network error are retried automatically with exponential backoff (honoring
-// Retry-After). Configure via Option values.
+// Client is safe for concurrent use and retries transient failures.
 type Client struct {
 	apiKey            string
 	baseURL           string
@@ -106,7 +91,6 @@ type Client struct {
 	maxRetries        int
 	httpClient        *http.Client
 	allowInsecureHTTP bool
-	baseRetryDelay    time.Duration // overridable in tests
 }
 
 // Option configures a Client.
@@ -152,12 +136,11 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 			"zpljet: missing API key — create one at https://zpljet.com/dashboard")
 	}
 	client := &Client{
-		apiKey:         strings.TrimSpace(apiKey),
-		baseURL:        defaultBaseURL,
-		timeout:        defaultTimeout,
-		maxRetries:     defaultMaxRetries,
-		httpClient:     &http.Client{},
-		baseRetryDelay: 500 * time.Millisecond,
+		apiKey:     strings.TrimSpace(apiKey),
+		baseURL:    defaultBaseURL,
+		timeout:    defaultTimeout,
+		maxRetries: defaultMaxRetries,
+		httpClient: &http.Client{},
 	}
 	for _, opt := range opts {
 		opt(client)
@@ -186,8 +169,6 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 	return client, nil
 }
 
-// assertSecureBaseURL refuses to send the API key over plaintext http:// to a
-// non-loopback host unless the caller opted in via WithAllowInsecureHTTP.
 func assertSecureBaseURL(baseURL string, allowInsecureHTTP bool) error {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -231,12 +212,7 @@ func (c *Client) Convert(ctx context.Context, req ConvertRequest) (*LabelData, e
 	}, nil
 }
 
-// ConvertToURL renders ZPL, has ZPLJet host the file (paid plans), and
-// returns a public link. Files are retained for the account's retention
-// window — a dashboard setting, up to the plan's maximum.
-//
-// Accounts that may not host (free plan, or enforced no-retention mode) get
-// an *Error with CodeHostingNotAllowed or CodeNoRetentionEnforced.
+// ConvertToURL renders and hosts a label, then returns its public URL.
 func (c *Client) ConvertToURL(ctx context.Context, req ConvertRequest) (*HostedLabel, error) {
 	_, body, err := c.doWithRetries(ctx, req, "url")
 	if err != nil {
@@ -244,8 +220,6 @@ func (c *Client) ConvertToURL(ctx context.Context, req ConvertRequest) (*HostedL
 	}
 	var hosted HostedLabel
 	if err := json.Unmarshal(body, &hosted); err != nil {
-		// Deliberately NOT a *ConnError: a 2xx body that fails to parse is
-		// not a transient network failure, and retrying it can't help.
 		return nil, fmt.Errorf("zpljet: invalid JSON in API response: %w", err)
 	}
 	if hosted.ID == "" || hosted.URL == "" || hosted.ExpiresAt.IsZero() ||
@@ -255,8 +229,6 @@ func (c *Client) ConvertToURL(ctx context.Context, req ConvertRequest) (*HostedL
 	return &hosted, nil
 }
 
-// doWithRetries POSTs the request as JSON, retrying transient failures, and
-// returns the successful response with its fully-read body.
 func (c *Client) doWithRetries(
 	ctx context.Context, req ConvertRequest, output string,
 ) (*http.Response, []byte, error) {
@@ -280,7 +252,6 @@ func (c *Client) doWithRetriesPayload(
 		var headerRetryAfter time.Duration
 		var headerRetryAfterOK bool
 		if attemptErr != nil {
-			// Caller cancellation is surfaced as-is and never retried.
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
 			}
@@ -294,15 +265,13 @@ func (c *Client) doWithRetriesPayload(
 		if attempt >= c.maxRetries || !isRetryable(failure) {
 			return nil, nil, failure
 		}
-		delay := c.retryDelay(failure, attempt, headerRetryAfter, headerRetryAfterOK)
+		delay := retryDelay(failure, attempt, headerRetryAfter, headerRetryAfterOK)
 		if err := sleepCtx(ctx, delay); err != nil {
 			return nil, nil, err
 		}
 	}
 }
 
-// doOnce performs a single HTTP attempt with its own timeout and reads the
-// full body.
 func (c *Client) doOnce(
 	ctx context.Context, path string, payload []byte,
 ) (*http.Response, []byte, error) {
@@ -349,10 +318,6 @@ func marshalRequest(req ConvertRequest, output string) ([]byte, error) {
 	return payload, nil
 }
 
-// isRetryable reports whether an error is worth retrying: network failures,
-// timeouts, rate limits, and transient 5xx. CodeConversionFailed (502) is
-// excluded — it means the engine rejected the ZPL itself, so a retry would
-// fail identically.
 func isRetryable(err error) bool {
 	var connErr *ConnError
 	if errors.As(err, &connErr) {
@@ -368,16 +333,12 @@ func isRetryable(err error) bool {
 	return apiErr.Status >= 500 && apiErr.Code != CodeConversionFailed
 }
 
-// parseRetryAfterHeader reads a Retry-After header value — delta-seconds or
-// an HTTP-date. ok is false when the header is absent or unparseable. Used
-// when the body carries no retryAfter field (e.g. a gateway 429/503 with an
-// HTML body). An explicit "0" means "retry immediately".
 func parseRetryAfterHeader(value string) (delay time.Duration, ok bool) {
 	if value == "" {
 		return 0, false
 	}
 	if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds >= 0 {
-		return time.Duration(seconds * float64(time.Second)), true
+		return retryAfterDuration(seconds), true
 	}
 	if when, err := http.ParseTime(value); err == nil {
 		if d := time.Until(when); d > 0 {
@@ -388,16 +349,11 @@ func parseRetryAfterHeader(value string) (delay time.Duration, ok bool) {
 	return 0, false
 }
 
-// retryDelay computes the sleep before the next retry — the body's
-// retryAfter, else the Retry-After header, else exponential backoff with
-// jitter. A server-sent retryAfter of 0 means "retry immediately", matching
-// the other ZPLJet SDKs.
-func (c *Client) retryDelay(
+func retryDelay(
 	err error, attempt int, headerRetryAfter time.Duration, headerRetryAfterOK bool,
 ) time.Duration {
 	var apiErr *Error
 	if errors.As(err, &apiErr) {
-		// Presence in Raw distinguishes an explicit 0 from an absent field.
 		if _, ok := apiErr.Raw["retryAfter"].(float64); ok {
 			if apiErr.RetryAfter > maxRetryDelay {
 				return maxRetryDelay
@@ -411,7 +367,7 @@ func (c *Client) retryDelay(
 		}
 		return headerRetryAfter
 	}
-	backoff := c.baseRetryDelay << attempt
+	backoff := baseRetryDelay << attempt
 	jitter := time.Duration(rand.Int63n(int64(backoff)/4 + 1))
 	if backoff+jitter > maxRetryDelay {
 		return maxRetryDelay
@@ -419,7 +375,6 @@ func (c *Client) retryDelay(
 	return backoff + jitter
 }
 
-// sleepCtx sleeps for the given duration, aborting early if ctx is done.
 func sleepCtx(ctx context.Context, duration time.Duration) error {
 	if duration <= 0 {
 		return ctx.Err()

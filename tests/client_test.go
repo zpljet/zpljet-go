@@ -1,4 +1,4 @@
-package zpljet
+package tests
 
 import (
 	"context"
@@ -13,20 +13,20 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zpljet/zpljet-go"
 )
 
 const testZPL = "^XA^FO50,50^A0N,50,50^FDHello^FS^XZ"
 
-// newTestClient points a client (with near-instant backoff) at a test server.
-func newTestClient(t *testing.T, handler http.Handler, opts ...Option) *Client {
+func newTestClient(t *testing.T, handler http.Handler, opts ...zpljet.Option) *zpljet.Client {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	client, err := New("zpl_test", append([]Option{WithBaseURL(server.URL), WithMaxRetries(0)}, opts...)...)
+	client, err := zpljet.New("zpl_test", append([]zpljet.Option{zpljet.WithBaseURL(server.URL), zpljet.WithMaxRetries(0)}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.baseRetryDelay = time.Millisecond
 	return client
 }
 
@@ -49,81 +49,121 @@ func writePDF(w http.ResponseWriter, id string) {
 }
 
 func TestNewRequiresAPIKey(t *testing.T) {
-	if _, err := New("   "); err == nil {
+	if _, err := zpljet.New("   "); err == nil {
 		t.Fatal("expected an error for a blank API key")
 	}
-}
-
-func TestNewAppliesDefaults(t *testing.T) {
-	client, err := New("zpl_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.baseURL != "https://api.zpljet.com" {
-		t.Errorf("baseURL = %q", client.baseURL)
-	}
-	if client.timeout != 60*time.Second {
-		t.Errorf("timeout = %v", client.timeout)
-	}
-	if client.maxRetries != 2 {
-		t.Errorf("maxRetries = %d", client.maxRetries)
+	if _, err := zpljet.New("zpl_test", zpljet.WithTimeout(0)); err == nil {
+		t.Fatal("expected an error for a zero timeout")
 	}
 }
 
-func TestNewValidatesAndCapsRetries(t *testing.T) {
-	if _, err := New("zpl_test", WithMaxRetries(-1)); err == nil {
+func TestMaxRetriesIsValidatedAndCapped(t *testing.T) {
+	if _, err := zpljet.New("zpl_test", zpljet.WithMaxRetries(-1)); err == nil {
 		t.Fatal("expected an error for negative max retries")
 	}
-	client, err := New("zpl_test", WithMaxRetries(99))
+
+	var calls atomic.Int32
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeError(w, 503, zpljet.CodeServiceUnavailable, "retry", `"retryAfter":0`)
+	}), zpljet.WithMaxRetries(99))
+	if _, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL}); err == nil {
+		t.Fatal("expected retries to be exhausted")
+	}
+	if calls.Load() != 11 {
+		t.Errorf("calls = %d, want 11", calls.Load())
+	}
+}
+
+func TestDefaultMaxRetries(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeError(w, 503, zpljet.CodeServiceUnavailable, "retry", `"retryAfter":0`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := zpljet.New("zpl_test", zpljet.WithBaseURL(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.maxRetries != maxRetriesCap {
-		t.Errorf("maxRetries = %d, want %d", client.maxRetries, maxRetriesCap)
+	if _, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL}); err == nil {
+		t.Fatal("expected retries to be exhausted")
+	}
+	if calls.Load() != 3 {
+		t.Errorf("calls = %d, want 3", calls.Load())
 	}
 }
 
 func TestWithBaseURLStripsTrailingSlashes(t *testing.T) {
-	client, _ := New("zpl_test", WithBaseURL("http://localhost:3000//"))
-	if client.baseURL != "http://localhost:3000" {
-		t.Errorf("baseURL = %q", client.baseURL)
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		writePDF(w, "conv_123")
+	}))
+	t.Cleanup(server.Close)
+	client, err := zpljet.New("zpl_test", zpljet.WithBaseURL(server.URL+"///"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL}); err != nil {
+		t.Fatal(err)
+	}
+	if path != "/v1/convert" {
+		t.Errorf("path = %q", path)
 	}
 }
 
 func TestNewRejectsInsecureRemoteBaseURL(t *testing.T) {
-	if _, err := New("zpl_test", WithBaseURL("http://api.example.com")); err == nil {
+	if _, err := zpljet.New("zpl_test", zpljet.WithBaseURL("http://api.example.com")); err == nil {
 		t.Fatal("expected insecure remote base URL to be rejected")
 	}
-	if _, err := New(
+	if _, err := zpljet.New(
 		"zpl_test",
-		WithBaseURL("http://api.example.com"),
-		WithAllowInsecureHTTP(),
+		zpljet.WithBaseURL("http://api.example.com"),
+		zpljet.WithAllowInsecureHTTP(),
 	); err != nil {
 		t.Fatalf("explicit insecure opt-in failed: %v", err)
 	}
 }
 
 func TestNewRejectsNilHTTPClient(t *testing.T) {
-	if _, err := New("zpl_test", WithHTTPClient(nil)); err == nil {
+	if _, err := zpljet.New("zpl_test", zpljet.WithHTTPClient(nil)); err == nil {
 		t.Fatal("expected nil HTTP client to be rejected")
 	}
 }
 
 func TestCustomHTTPClientCannotFollowRedirects(t *testing.T) {
-	custom := &http.Client{
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return nil },
-	}
-	client, err := New("zpl_test", WithHTTPClient(custom))
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetCalls.Add(1)
+	}))
+	t.Cleanup(target.Close)
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(source.Close)
+
+	var followed atomic.Bool
+	custom := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		followed.Store(true)
+		return nil
+	}}
+	client, err := zpljet.New(
+		"zpl_test",
+		zpljet.WithBaseURL(source.URL),
+		zpljet.WithHTTPClient(custom),
+		zpljet.WithMaxRetries(0),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	err = client.httpClient.CheckRedirect(&http.Request{}, nil)
-	if !errors.Is(err, http.ErrUseLastResponse) {
-		t.Fatalf("CheckRedirect error = %v", err)
+	_, err = client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
+	var apiErr *zpljet.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("err = %v", err)
 	}
-	if custom.CheckRedirect == nil {
-		t.Fatal("custom client was mutated")
+	if followed.Load() || targetCalls.Load() != 0 {
+		t.Fatal("client followed redirect")
 	}
 }
 
@@ -136,7 +176,7 @@ func TestConvertPostsJSONWithAPIKeyAndUserAgent(t *testing.T) {
 		writePDF(w, "conv_123")
 	}))
 
-	_, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL, DPMM: 12, Format: FormatPDF})
+	_, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL, DPMM: 12, Format: zpljet.FormatPDF})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +186,7 @@ func TestConvertPostsJSONWithAPIKeyAndUserAgent(t *testing.T) {
 	if got := captured.Header.Get("X-API-Key"); got != "zpl_test" {
 		t.Errorf("X-API-Key = %q", got)
 	}
-	if got := captured.Header.Get("User-Agent"); got != "zpljet-go/"+Version {
+	if got := captured.Header.Get("User-Agent"); got != "zpljet-go/"+zpljet.Version {
 		t.Errorf("User-Agent = %q", got)
 	}
 	want := map[string]any{"zpl": testZPL, "dpmm": float64(12), "format": "pdf"}
@@ -167,7 +207,7 @@ func TestConvertOmitsUnsetParameters(t *testing.T) {
 		writePDF(w, "conv_123")
 	}))
 
-	if _, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL}); err != nil {
+	if _, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL}); err != nil {
 		t.Fatal(err)
 	}
 	if len(capturedBody) != 1 {
@@ -180,7 +220,7 @@ func TestConvertReturnsBytesContentTypeAndID(t *testing.T) {
 		writePDF(w, "conv_abc")
 	}))
 
-	label, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
+	label, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +245,7 @@ func TestConvertToURLReturnsParsedHostedLabel(t *testing.T) {
 			"expiresAt":"2026-07-10T00:00:00.000Z"}`)
 	}))
 
-	hosted, err := client.ConvertToURL(context.Background(), ConvertRequest{ZPL: testZPL})
+	hosted, err := client.ConvertToURL(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,9 +266,9 @@ func TestConvertToURLRejectsMalformedSuccessWithoutRetry(t *testing.T) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"id":"conv_456"}`)
-	}), WithMaxRetries(5))
+	}), zpljet.WithMaxRetries(5))
 
-	_, err := client.ConvertToURL(context.Background(), ConvertRequest{ZPL: testZPL})
+	_, err := client.ConvertToURL(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err == nil || !strings.Contains(err.Error(), "invalid hosted conversion payload") {
 		t.Fatalf("err = %v", err)
 	}
@@ -239,16 +279,16 @@ func TestConvertToURLRejectsMalformedSuccessWithoutRetry(t *testing.T) {
 
 func TestErrorMapping(t *testing.T) {
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, 402, CodeQuotaExceeded, "Monthly quota exceeded",
+		writeError(w, 402, zpljet.CodeQuotaExceeded, "Monthly quota exceeded",
 			`"plan":"free","quota":500,"used":500,"resetsAt":"2026-08-01T00:00:00.000Z"`)
 	}))
 
-	_, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
-	var apiErr *Error
+	_, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
+	var apiErr *zpljet.Error
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %v (%T)", err, err)
 	}
-	if apiErr.Status != 402 || apiErr.Code != CodeQuotaExceeded {
+	if apiErr.Status != 402 || apiErr.Code != zpljet.CodeQuotaExceeded {
 		t.Errorf("Status=%d Code=%q", apiErr.Status, apiErr.Code)
 	}
 	if apiErr.Plan != "free" || apiErr.Quota != 500 || apiErr.Used != 500 {
@@ -264,11 +304,11 @@ func TestErrorMapping(t *testing.T) {
 
 func TestInvalidRequestCarriesParam(t *testing.T) {
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, 400, CodeInvalidRequest, "zpl: no label found", `"param":"zpl"`)
+		writeError(w, 400, zpljet.CodeInvalidRequest, "zpl: no label found", `"param":"zpl"`)
 	}))
 
-	_, err := client.Convert(context.Background(), ConvertRequest{ZPL: "nope"})
-	var apiErr *Error
+	_, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: "nope"})
+	var apiErr *zpljet.Error
 	if !errors.As(err, &apiErr) || apiErr.Param != "zpl" {
 		t.Fatalf("err = %v", err)
 	}
@@ -280,8 +320,8 @@ func TestNonJSONErrorBodyGetsDefaultMessage(t *testing.T) {
 		_, _ = w.Write([]byte("<html>Bad Gateway</html>"))
 	}))
 
-	_, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
-	var apiErr *Error
+	_, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
+	var apiErr *zpljet.Error
 	if !errors.As(err, &apiErr) || apiErr.Status != 503 {
 		t.Fatalf("err = %v", err)
 	}
@@ -294,13 +334,13 @@ func TestRetriesA429AndSucceeds(t *testing.T) {
 	var calls atomic.Int32
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
-			writeError(w, 429, CodeRateLimitExceeded, "slow down", `"retryAfter":0`)
+			writeError(w, 429, zpljet.CodeRateLimitExceeded, "slow down", `"retryAfter":0`)
 			return
 		}
 		writePDF(w, "conv_123")
-	}), WithMaxRetries(2))
+	}), zpljet.WithMaxRetries(2))
 
-	label, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
+	label, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,12 +353,12 @@ func TestRateLimitContextOnceExhausted(t *testing.T) {
 	var calls atomic.Int32
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		writeError(w, 429, CodeRateLimitExceeded, "slow down",
+		writeError(w, 429, zpljet.CodeRateLimitExceeded, "slow down",
 			`"retryAfter":0.001,"retryAt":"2026-07-07T00:00:01.000Z"`)
-	}), WithMaxRetries(2))
+	}), zpljet.WithMaxRetries(2))
 
-	_, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
-	var apiErr *Error
+	_, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
+	var apiErr *zpljet.Error
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %v", err)
 	}
@@ -340,12 +380,9 @@ func TestHonorsRetryAfterHeaderWhenBodyIsNotJSON(t *testing.T) {
 			return
 		}
 		writePDF(w, "conv_123")
-	}), WithMaxRetries(1))
-	// Make backoff long so the test only passes if the header (0s) is used.
-	client.baseRetryDelay = 10 * time.Second
-
+	}), zpljet.WithMaxRetries(1))
 	start := time.Now()
-	label, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
+	label, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,42 +394,60 @@ func TestHonorsRetryAfterHeaderWhenBodyIsNotJSON(t *testing.T) {
 	}
 }
 
+func TestHonorsPastRetryAfterDate(t *testing.T) {
+	var calls atomic.Int32
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writePDF(w, "conv_123")
+	}), zpljet.WithMaxRetries(1))
+
+	if _, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL}); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Errorf("calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestInvalidRetryAfterHeaderUsesBackoff(t *testing.T) {
+	var calls atomic.Int32
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "later")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writePDF(w, "conv_123")
+	}), zpljet.WithMaxRetries(1))
+
+	start := time.Now()
+	if _, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 400*time.Millisecond {
+		t.Errorf("elapsed = %v, expected backoff", elapsed)
+	}
+}
+
 func TestRetryAfterZeroRetriesImmediately(t *testing.T) {
 	var calls atomic.Int32
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
-			writeError(w, 429, CodeRateLimitExceeded, "slow down", `"retryAfter":0`)
+			writeError(w, 429, zpljet.CodeRateLimitExceeded, "slow down", `"retryAfter":0`)
 			return
 		}
 		writePDF(w, "conv_123")
-	}), WithMaxRetries(1))
-	// A retryAfter of 0 must mean "immediately" — not fall through to backoff.
-	client.baseRetryDelay = 10 * time.Second
-
+	}), zpljet.WithMaxRetries(1))
 	start := time.Now()
-	if _, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL}); err != nil {
+	if _, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL}); err != nil {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("took %v — explicit retryAfter:0 fell through to backoff", elapsed)
-	}
-}
-
-func TestParseRetryAfterHeader(t *testing.T) {
-	if d, ok := parseRetryAfterHeader("7"); !ok || d != 7*time.Second {
-		t.Errorf("delta-seconds = %v ok=%v", d, ok)
-	}
-	if d, ok := parseRetryAfterHeader("0"); !ok || d != 0 {
-		t.Errorf("explicit zero = %v ok=%v", d, ok)
-	}
-	if _, ok := parseRetryAfterHeader(""); ok {
-		t.Error("empty should not be ok")
-	}
-	if _, ok := parseRetryAfterHeader("soon"); ok {
-		t.Error("garbage should not be ok")
-	}
-	if d, ok := parseRetryAfterHeader("Tue, 07 Jul 2099 00:00:00 GMT"); !ok || d <= 0 {
-		t.Errorf("http-date = %v ok=%v", d, ok)
 	}
 }
 
@@ -402,17 +457,17 @@ func TestConvertToURLParseFailureIsNotAConnError(t *testing.T) {
 		_, _ = w.Write([]byte("not json at all"))
 	}))
 
-	_, err := client.ConvertToURL(context.Background(), ConvertRequest{ZPL: testZPL})
+	_, err := client.ConvertToURL(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	var connErr *ConnError
+	var connErr *zpljet.ConnError
 	if errors.As(err, &connErr) {
-		t.Fatalf("parse failure must not be a *ConnError (looks retryable): %v", err)
+		t.Fatalf("parse failure must not be a *zpljet.ConnError (looks retryable): %v", err)
 	}
-	var apiErr *Error
+	var apiErr *zpljet.Error
 	if errors.As(err, &apiErr) {
-		t.Fatalf("parse failure must not be an *Error either: %v", err)
+		t.Fatalf("parse failure must not be an *zpljet.Error either: %v", err)
 	}
 }
 
@@ -420,11 +475,11 @@ func TestConversionFailedIsNeverRetried(t *testing.T) {
 	var calls atomic.Int32
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		writeError(w, 502, CodeConversionFailed, "Could not render", `"conversionId":"conv_x"`)
-	}), WithMaxRetries(5))
+		writeError(w, 502, zpljet.CodeConversionFailed, "Could not render", `"conversionId":"conv_x"`)
+	}), zpljet.WithMaxRetries(5))
 
-	_, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
-	var apiErr *Error
+	_, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
+	var apiErr *zpljet.Error
 	if !errors.As(err, &apiErr) || apiErr.ConversionID != "conv_x" {
 		t.Fatalf("err = %v", err)
 	}
@@ -437,10 +492,10 @@ func TestNeverRetries4xxClientErrors(t *testing.T) {
 	var calls atomic.Int32
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		writeError(w, 400, CodeInvalidRequest, "bad", `"param":"zpl"`)
-	}), WithMaxRetries(5))
+		writeError(w, 400, zpljet.CodeInvalidRequest, "bad", `"param":"zpl"`)
+	}), zpljet.WithMaxRetries(5))
 
-	_, _ = client.Convert(context.Background(), ConvertRequest{ZPL: "x"})
+	_, _ = client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: "x"})
 	if calls.Load() != 1 {
 		t.Errorf("calls = %d", calls.Load())
 	}
@@ -455,9 +510,9 @@ func TestRetriesTransient5xx(t *testing.T) {
 			return
 		}
 		writePDF(w, "conv_123")
-	}), WithMaxRetries(1))
+	}), zpljet.WithMaxRetries(1))
 
-	label, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
+	label, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +522,6 @@ func TestRetriesTransient5xx(t *testing.T) {
 }
 
 func TestRetriesConnectionErrors(t *testing.T) {
-	// A server that immediately closes the connection on the first call.
 	var calls atomic.Int32
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
@@ -480,9 +534,9 @@ func TestRetriesConnectionErrors(t *testing.T) {
 			return
 		}
 		writePDF(w, "conv_123")
-	}), WithMaxRetries(1))
+	}), zpljet.WithMaxRetries(1))
 
-	label, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
+	label, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,16 +546,14 @@ func TestRetriesConnectionErrors(t *testing.T) {
 }
 
 func TestPersistentConnectionFailureReturnsConnError(t *testing.T) {
-	client, err := New("zpl_test",
-		WithBaseURL("http://127.0.0.1:1"), // nothing listens here
-		WithMaxRetries(1))
+	client, err := zpljet.New("zpl_test",
+		zpljet.WithBaseURL("http://127.0.0.1:1"), // nothing listens here
+		zpljet.WithMaxRetries(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.baseRetryDelay = time.Millisecond
-
-	_, err = client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
-	var connErr *ConnError
+	_, err = client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
+	var connErr *zpljet.ConnError
 	if !errors.As(err, &connErr) {
 		t.Fatalf("err = %v (%T)", err, err)
 	}
@@ -510,12 +562,6 @@ func TestPersistentConnectionFailureReturnsConnError(t *testing.T) {
 	}
 }
 
-// hangingHandler blocks until the client goes away or unblock is called. It
-// drains the body first — the server only notices a dropped client (and
-// cancels r.Context()) once the request body has been consumed — and also
-// waits on an unblock channel as a safety net so httptest's server.Close
-// (which waits for outstanding handlers) can never deadlock. Register
-// t.Cleanup(unblock) AFTER newTestClient so it runs before server.Close.
 func hangingHandler(calls *atomic.Int32) (handler http.Handler, unblock func()) {
 	done := make(chan struct{})
 	var once sync.Once
@@ -534,11 +580,11 @@ func hangingHandler(calls *atomic.Int32) (handler http.Handler, unblock func()) 
 
 func TestTimesOutAnAttempt(t *testing.T) {
 	handler, unblock := hangingHandler(nil)
-	client := newTestClient(t, handler, WithTimeout(50*time.Millisecond))
+	client := newTestClient(t, handler, zpljet.WithTimeout(50*time.Millisecond))
 	t.Cleanup(unblock)
 
-	_, err := client.Convert(context.Background(), ConvertRequest{ZPL: testZPL})
-	var connErr *ConnError
+	_, err := client.Convert(context.Background(), zpljet.ConvertRequest{ZPL: testZPL})
+	var connErr *zpljet.ConnError
 	if !errors.As(err, &connErr) || !connErr.Timeout() {
 		t.Fatalf("err = %v (%T)", err, err)
 	}
@@ -547,12 +593,12 @@ func TestTimesOutAnAttempt(t *testing.T) {
 func TestCallerCancellationPropagatesAndIsNeverRetried(t *testing.T) {
 	var calls atomic.Int32
 	handler, unblock := hangingHandler(&calls)
-	client := newTestClient(t, handler, WithMaxRetries(5))
+	client := newTestClient(t, handler, zpljet.WithMaxRetries(5))
 	t.Cleanup(unblock)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := client.Convert(ctx, ConvertRequest{ZPL: testZPL})
+	_, err := client.Convert(ctx, zpljet.ConvertRequest{ZPL: testZPL})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v", err)
 	}
@@ -570,7 +616,7 @@ func TestAlreadyCancelledContextShortCircuits(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := client.Convert(ctx, ConvertRequest{ZPL: testZPL})
+	_, err := client.Convert(ctx, zpljet.ConvertRequest{ZPL: testZPL})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
 	}
